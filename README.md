@@ -1,2 +1,119 @@
-# omni-robot-path-control-algorithm
-Research on omni robnot path finding and orientation algorithm with the assistance of neural network.. Guided by professor  Aleksander Krasnov.
+# omr — 三轮全向机器人约束跟踪控制（22482 复现）
+
+英文版：[README.en.md](README.en.md)
+
+按职责分五类，`omr_setup.m` 负责把子目录一次性加入 MATLAB 路径。
+
+```
+omr/
+├─ omr_setup.m     路径初始化（唯一入口）
+├─ core/           L1 仿真核心
+│   ├─ omr_sim.m      定步长积分（ode1/ode3/ode4），返回 r
+│   └─ omr_rhs.m      闭环右端项 dq/dV/控制器状态导数
+├─ control/        L2 控制器
+│   ├─ omr_ctrl_eval.m          按 p.controller 分发（"v1" / "v2"）
+│   ├─ omr_control_core.m       式 (6)(8)(10)-(12)(16)(18)(22)(24)(25)(34) 的唯一实现
+│   ├─ omr_alpha.m              式 (18) 虚拟控制（控制律与初值共用）
+│   ├─ omr_control.m            v1：Ĝ ≡ 0（第一版，不含 RBF 网络）
+│   ├─ omr_control_v2.m         v2：Ĝ 由 RBFNN 观测器给出（第二版）
+│   └─ omr_rbfnn_observer_v2.m  式 (9)+(35)：Ĝ 与 Ŵ̇，附投影与诊断
+├─ model/          L3 数据
+│   ├─ omr_params.m        预设（"v1" / "v2"）、派生矩阵、索引结构体 p.idx
+│   └─ omr_reference.m     参考轨迹与扰动
+├─ view/           可视化
+│   ├─ omr_animate.m          由 r 生成机器人动画 GIF
+│   └─ omr_animate_compare.m  两版叠加动画（左轨迹 / 右上误差游标 / 右下参考点邻域放大）
+├─ app/            入口
+│   ├─ run_demo.m              第一版一键复现（曲线 + 指标 + 动画）
+│   ├─ run_compare_observer.m  第一版 vs 第二版对照（表格 + 四子图）
+│   ├─ testbed_run.m           多场景测试台（驱动 model_OMR_extend_R2022b.slx）
+│   └─ testbed_scenarios.m     场景定义
+└─ out/            运行产物
+```
+
+## 两个版本
+
+两版**只有一点不同**：式 (25) 里未知项 `G = A1·V + F(V)` 的估计 `Ĝ` 从哪来；
+其余方程、增益、正则化、被控对象完全相同（共用 `omr_control_core.m`）。
+
+| 版本 | 入口 | Ĝ 的来源 |
+|---|---|---|
+| `v1` 第一版 | `omr_control.m` | `Ĝ ≡ 0`，完全不补偿 |
+| `v2` 第二版 | `omr_control_v2.m` → `omr_rbfnn_observer_v2.m` | RBF 网络：`Ĝ_i = Ŵ_iᵀφ_i`，权重按式 (35) 自适应 |
+
+## 运行方式
+
+```matlab
+addpath('<...>/omr');  omr_setup();
+run_demo(80, 1e-3)               % 第一版：图 + 指标 + 动画
+run_compare_observer(80, 1e-3)   % 两版对照：表格 + fig_v1_vs_v2.png
+testbed_run()                    % 驱动 Simulink 模型跑三个场景（需要 R2022b 与 .slx）
+```
+
+每个入口脚本内部都会自行定位 `omr/` 根目录并调用 `omr_setup()`，所以直接把
+`omr/app` 加到路径后单独运行也可以。
+
+## 80 s 结果（ode4、1 ms、初值 q0=[0.4;-0.4;0.3]）
+
+误差统计分两段：**0–40 s 寻找轨迹**（从 q0 追到参考线上，误差 dm 量级）、
+**40–80 s 纯循迹**（已在轨迹上）。下表峰值指标**只统计纯循迹段**——全程峰值
+几乎都是起始那一下造成的，用它评价控制品质没有意义。
+
+| 指标 | v1 第一版 | v2 第二版（RBF） | 变化 |
+|---|---|---|---|
+| rms\|e1\|（全程） | 0.0651 m | 0.0613 m | −5.9 % |
+| **rms\|e1\|（纯循迹）** | 0.0297 m | 0.0124 m | **−58.1 %** |
+| **max\|e1\|（纯循迹）** | 0.0559 m | 0.0243 m | **−56.6 %** |
+| 末端 \|e1\| | 0.0536 m | 0.0171 m | −68.1 % |
+| max\|e2\|（纯循迹） | 2.748 | 1.089 | −60.4 % |
+| max\|τ\|（纯循迹） | 6.58 N·m | 14.78 N·m | +124.8 %（变大） |
+| max\|e1\|（寻找段，参考） | 0.4316 m | 0.4031 m | — |
+| rms\|G−Ĝ\| | 0.0342 | 0.0472 | — |
+
+两版的 `max|e1|` 都小于障碍边界 0.5 m（纯循迹段还小一个量级）；`max|e2|` 超过 0.5
+是 λ2 近零的瞬时采样点，两版都收敛。v2 的辨识误差 rms 反而比 v1 的 `|G|` 还大
+（0.047 vs 0.034）——RBF 的强项不是"估得准"，而是"补偿的相位对"，把循迹误差压掉一半以上。
+
+**力矩峰值要分开看**：v2 在纯循迹段的 `max|τ|` 反而是 v1 的 2.2 倍。原因是观测器的
+更新律直接吃 λ2（式 35），λ2 的薄障壁尖峰被它变成高频力矩抖动；这正是"平滑度改善
+有限"的根源（分析见 docs 第 5 节）。全程看到的"25.5 → 14.8 N·m"是起始瞬态造成的
+假象：v1 的 25.5 N·m 发生在 0–40 s 的追赶阶段。
+
+## 参数与固定设置
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| `k1 / k2` | 0.5 / 0.1 | 障碍反馈增益（论文数值） |
+| `b1 = b2` | 0.5 | 误差障碍边界 |
+| `τ_max` | ±300 N·m | 执行器限幅，被控对象吃 `sat(τ)`（式 8） |
+| `λ2` 分母下限 `lam2_floor` | `1e-3` | `|λ2|` 可小到 1e-8，直接相除会给出 1e4 量级力矩 |
+| `λ1/λ2` 比值上限 `ratio_max` | 50 | 同上，工程正则化 |
+| `λ2` 上限 `lam2_max` | 75.9 | 由 `τ_max/(1.5·‖Binv‖∞)` 反推 |
+| `ξ1(0)` | `α(0)` 现算 | 改任何参数都不会像硬编码那样失配 |
+| RBF 节点 | 11（每轴），σ=2，ρ=ρ_w=2 | 式 (9)/(35)，另加 `‖W‖ ≤ 50` 投影 |
+
+## 与论文/Simulink 的关系
+
+- 式 (5) 的 `B` 第二行在论文里印成 `+√3b1, +√3b1`，会让 `B` 奇异；同页式 (3) 写的是
+  `(√3/2)(f1 − f2)`（自带负号）。代码按式 (3) 取 `[√3b1, −√3b1, 0]`，并有 `det(B)` 断言。
+- 式 (18) 的分母在论文里是 `2πe1`（`e1→0` 时为可去奇点）；`.slx` 里写成 `2πe1 + 0.01`，
+  把奇点平移成 `e1 = −1.592e-3` 的真极点。代码沿用 `.slx` 的 `+0.01`（与交付模型一致），
+  这也是长时曲线对采样点敏感的原因。
+- 交付的 `.slx` 里 `lambda1/lambda2.*S*e2` 是矩阵右除（3×3 秩 1，只用 `argmax|λ2|` 的通道），
+  属 Simulink 实现中的写法问题；本仓库按论文原意用逐元素相除，不再复刻该写法。
+
+## 依赖关系
+
+`app → omr_sim → {omr_ctrl_eval → omr_control_core, omr_rhs} → omr_reference`；
+`omr_params` 产生的 `p` 被所有模块只读引用；`omr_animate` 只消费 `omr_sim` 的输出 `r`。
+
+## out/ 产物
+
+| 文件 | 内容 |
+|---|---|
+| `fig_v1_tracking.png` / `fig_v1_control.png` | 第一版的轨迹/误差图与控制量图（阴影 = 纯循迹段） |
+| `fig_v1_vs_v2.png` | 两版对照四子图（‖e1‖、max\|τ\|、G vs Ĝ、指标柱状） |
+| `metrics_v1.csv` / `metrics_v2.csv` / `compare_v1_v2.csv` | 指标表（列含 `rms_e1_all/rms_e1_track/max_e1_seek/max_e1_track/...`，分段统计） |
+| `run_v1.mat` / `run_v2.mat` | 仿真日志，**1/10 抽样**（峰值以 CSV 为准） |
+| `omr_animation.gif` | 第一版三轮车动画，161 帧、20 fps（8.1 s） |
+| `omr_compare.gif` | **两版叠加动画**：左=两条轨迹，右上=‖e1‖(t) 游标，右下=参考点邻域放大（两车同刻对比） |
